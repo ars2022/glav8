@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Arsendjer</title>
+  <style>
+    :root { --bg: #f0f2f5; --card: #fff; --primary: #0a7cff; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); height: 100dvh; display: flex; justify-content: center; align-items: center; }
+    .app { width: 100%; max-width: 500px; height: 100vh; background: var(--card); display: flex; flex-direction: column; overflow: hidden; }
+    .screen { display: none; flex-direction: column; height: 100%; padding: 16px; }
+    .screen.active { display: flex; }
+    input, button { font-size: 16px; padding: 12px; border-radius: 10px; border: 1px solid #d1d5db; width: 100%; margin-bottom: 8px; }
+    button { background: var(--primary); color: white; border: none; cursor: pointer; font-weight: bold; }
+    button.secondary { background: #e5e7eb; color: #1f2937; }
+    .msg { background: #e4e6eb; padding: 10px; border-radius: 12px; margin: 6px 0; max-width: 80%; word-break: break-word; }
+    .msg.me { background: #0084ff; color: white; align-self: flex-end; }
+    .chat-area { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; }
+    .attach-btns { display: flex; gap: 6px; }
+    .attach-btns button { flex: 1; padding: 10px; font-size: 14px; }
+    .hidden { display: none !important; }
+    .contacts-list { list-style: none; padding: 0; }
+    .contact { padding: 12px; background: #f9fafb; margin: 6px 0; border-radius: 10px; cursor: pointer; display: flex; justify-content: space-between; }
+    .contact:hover { background: #eef2ff; }
+    .recording { background: #ef4444 !important; color: white; }
+    .btn-group { display: flex; gap: 10px; }
+    .btn-group button { flex: 1; }
+    .name-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .name-row span { font-weight: 600; }
+    .name-row button { width: auto; padding: 6px 12px; margin: 0; }
+    .error-msg { color: red; margin-top: 8px; font-weight: bold; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/paho-mqtt@1.1.0/paho-mqtt.min.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+  <!-- Экран входа / регистрации -->
+  <div id="loginScreen" class="screen active">
+    <h2>🔐 Arsendjer</h2>
+    <p style="color:gray;">Создай новый аккаунт или войди</p>
+    <input type="text" id="pubIdInput" placeholder="Публичный ID (твой уникальный код)">
+    <input type="password" id="secretInput" placeholder="Секретный ключ (для синхронизации)">
+    <input type="text" id="nameInput" placeholder="Твоё имя (как тебя увидят)">
+    <div class="btn-group">
+      <button id="registerBtn" class="secondary">✍️ Зарегистрироваться</button>
+      <button id="loginBtn">🔑 Войти</button>
+    </div>
+    <div id="loginMsg" class="error-msg"></div>
+    <button id="cancelConnectBtn" class="secondary hidden" style="background:#eee;">Отмена</button>
+    <small style="color:gray;margin-top:12px;">Публичный ID — твой адрес для связи. Секретный ключ нужен для восстановления переписки на других устройствах.</small>
+  </div>
+
+  <!-- Главный экран (контакты) -->
+  <div id="mainScreen" class="screen">
+    <div class="name-row">
+      <span>👤 <span id="currentNameDisplay"></span></span>
+      <button id="changeNameBtn" class="secondary" style="font-size:14px;">✏️</button>
+    </div>
+    <div style="display:flex; gap:6px;">
+      <input type="text" id="addContactInput" placeholder="Введи ID собеседника">
+      <button id="addContactBtn" style="width:auto;">➕ Добавить</button>
+    </div>
+    <h3>📇 Мои контакты</h3>
+    <ul id="contactsList" class="contacts-list"></ul>
+    <button id="logoutBtn" class="secondary" style="margin-top:auto;">🚪 Выйти</button>
+  </div>
+
+  <!-- Экран чата -->
+  <div id="chatScreen" class="screen">
+    <div style="display:flex; align-items:center; gap:10px;">
+      <button id="backBtn" class="secondary" style="width:auto; padding:10px;">←</button>
+      <strong id="chatTitle"></strong>
+    </div>
+    <div id="chatMessages" class="chat-area"></div>
+    <div class="attach-btns">
+      <button id="attachPhotoBtn">📷 Фото</button>
+      <button id="attachVideoBtn">🎬 Видео</button>
+      <button id="recordVoiceBtn" class="secondary">🎤 Голос</button>
+    </div>
+    <div style="display:flex; gap:6px;">
+      <input type="text" id="messageInput" placeholder="Сообщение...">
+      <button id="sendBtn" style="width:auto;">→</button>
+    </div>
+    <div id="recordingStatus" style="text-align:center;color:red;font-weight:bold;margin:5px;"></div>
+  </div>
+</div>
+
+<script>
+  window.addEventListener('DOMContentLoaded', () => {
+    if (typeof Paho === 'undefined') {
+      document.getElementById('loginMsg').innerText = 'Ошибка загрузки библиотеки. Проверьте интернет.';
+      return;
+    }
+
+    // ==================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ====================
+    let myPublicId = '';
+    let mySecret = '';
+    let myName = '';
+    let currentChatId = null;
+    let client = null;
+    let connectTimer = null;
+
+    const BROKERS = [
+      'wss://broker.hivemq.com:8000/mqtt',
+      'wss://test.mosquitto.org:8081/mqtt',
+      'wss://mqtt.eclipseprojects.io/mqtt',
+      'wss://broker.emqx.io:8084/mqtt'
+    ];
+
+    // ==================== MQTT ====================
+    function connectToBroker(index = 0) {
+      if (index >= BROKERS.length) {
+        document.getElementById('loginMsg').innerText = 'Все серверы недоступны. Попробуйте позже.';
+        resetButtons();
+        return;
+      }
+
+      if (client) client.disconnect();
+      client = new Paho.MQTT.Client(BROKERS[index], myPublicId + '_' + Math.random().toString(36).substr(2,8));
+      client.onConnectionLost = () => {
+        console.warn('Соединение потеряно, переподключаемся...');
+        setTimeout(() => connectToBroker(0), 3000);
+      };
+      client.onMessageArrived = onMessage;
+
+      document.getElementById('loginMsg').innerText = `Подключение к серверу ${index+1}/${BROKERS.length}…`;
+      client.connect({
+        onSuccess: () => {
+          clearTimeout(connectTimer);
+          console.log('MQTT подключен');
+          client.subscribe('arsendjer/chat/' + myPublicId);
+          resetButtons();
+          showMain();
+        },
+        onFailure: (err) => {
+          clearTimeout(connectTimer);
+          console.warn('Ошибка:', err.errorMessage);
+          connectToBroker(index + 1);
+        },
+        timeout: 5,
+        keepAliveInterval: 30
+      });
+
+      connectTimer = setTimeout(() => {
+        if (client && !client.isConnected()) {
+          client.disconnect();
+          connectToBroker(index + 1);
+        }
+      }, 6000);
+    }
+
+    function onMessage(message) {
+      try {
+        const data = JSON.parse(message.payloadString);
+        if (data.from === myPublicId) return;
+        saveMessage(data.from, data);
+        if (currentChatId === data.from) renderChat(data.from);
+      } catch(e) {}
+    }
+
+    function sendChatMessage(contactId, payload) {
+      const topic = 'arsendjer/chat/' + contactId;
+      const msg = new Paho.MQTT.Message(JSON.stringify(payload));
+      msg.destinationName = topic;
+      if (client && client.isConnected()) client.send(msg);
+      saveMessage(contactId, payload);
+    }
+
+    // ==================== ХРАНИЛИЩЕ ====================
+    function getHistory(contactId) {
+      return JSON.parse(localStorage.getItem(`chat_${myPublicId}_${contactId}`) || '[]');
+    }
+    function setHistory(contactId, messages) {
+      localStorage.setItem(`chat_${myPublicId}_${contactId}`, JSON.stringify(messages.slice(-200)));
+    }
+    function saveMessage(contactId, msg) {
+      msg.time = Date.now();
+      const hist = getHistory(contactId);
+      hist.push(msg);
+      setHistory(contactId, hist);
+      if (currentChatId === contactId) renderChat(contactId);
+    }
+
+    function getContacts() {
+      return JSON.parse(localStorage.getItem(`contacts_${myPublicId}`) || '[]');
+    }
+    function setContacts(contacts) {
+      localStorage.setItem(`contacts_${myPublicId}`, JSON.stringify(contacts));
+    }
+
+    // Облачное сохранение профиля
+    async function uploadProfileToCloud() {
+      const profile = { contacts: getContacts(), chats: {} };
+      for (const cid of getContacts()) {
+        profile.chats[cid] = getHistory(cid);
+      }
+      const encrypted = await encryptData(JSON.stringify(profile), mySecret);
+      const blob = new Blob([encrypted], { type: 'application/json' });
+      const file = new File([blob], `profile_${myPublicId}.json`, { type: 'application/json' });
+      const fd = new FormData();
+      fd.append('reqtype', 'fileupload');
+      fd.append('fileToUpload', file);
+      const resp = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: fd });
+      if (!resp.ok) throw new Error('Ошибка загрузки профиля');
+      const url = await resp.text();
+      if (!url.startsWith('http')) throw new Error(url);
+    }
+
+    async function downloadProfileFromCloud() {
+      const url = `https://files.catbox.moe/profile_${myPublicId}.json`;
+      const resp = await fetch(url, { cache: 'no-cache' });
+      if (!resp.ok) return false;
+      const encryptedText = await resp.text();
+      const decrypted = await decryptData(encryptedText, mySecret);
+      const profile = JSON.parse(decrypted);
+      if (profile.contacts) setContacts(profile.contacts);
+      if (profile.chats) {
+        for (const [cid, msgs] of Object.entries(profile.chats)) {
+          setHistory(cid, msgs);
+        }
+      }
+      return true;
+    }
+
+    // ==================== ШИФРОВАНИЕ ====================
+    async function encryptData(text, password) {
+      const enc = new TextEncoder();
+      const pwHash = await crypto.subtle.digest('SHA-256', enc.encode(password));
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const key = await crypto.subtle.importKey('raw', pwHash, { name: 'AES-GCM' }, false, ['encrypt']);
+      const encoded = enc.encode(text);
+      const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+      const combined = new Uint8Array(iv.byteLength + encrypted.byteLength);
+      combined.set(iv, 0);
+      combined.set(new Uint8Array(encrypted), iv.byteLength);
+      return btoa(String.fromCharCode(...combined));
+    }
+
+    async function decryptData(encryptedBase64, password) {
+      const enc = new TextEncoder();
+      const pwHash = await crypto.subtle.digest('SHA-256', enc.encode(password));
+      const key = await crypto.subtle.importKey('raw', pwHash, { name: 'AES-GCM' }, false, ['decrypt']);
+      const combined = Uint8Array.from(atob(encryptedBase64), c => c.charCodeAt(0));
+      const iv = combined.slice(0, 12);
+      const data = combined.slice(12);
+      const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+      return new TextDecoder().decode(decrypted);
+    }
+
+    // ==================== ЭКРАНЫ ====================
+    const loginScreen = document.getElementById('loginScreen');
+    const mainScreen = document.getElementById('mainScreen');
+    const chatScreen = document.getElementById('chatScreen');
+
+    function showMain() {
+      loginScreen.classList.remove('active');
+      mainScreen.classList.add('active');
+      chatScreen.classList.remove('active');
+      document.getElementById('currentNameDisplay').innerText = myName;
+      updateContactList();
+    }
+    function showChat(contactId) {
+      loginScreen.classList.remove('active');
+      mainScreen.classList.remove('active');
+      chatScreen.classList.add('active');
+      currentChatId = contactId;
+      document.getElementById('chatTitle').innerText = contactId;
+      renderChat(contactId);
+    }
+    function updateContactList() {
+      const list = document.getElementById('contactsList');
+      const contacts = getContacts();
+      list.innerHTML = '';
+      contacts.forEach(id => {
+        const li = document.createElement('li');
+        li.className = 'contact';
+        li.innerHTML = `<span>${id}</span>`;
+        li.onclick = () => showChat(id);
+        list.appendChild(li);
+      });
+    }
+    function resetButtons() {
+      const reg = document.getElementById('registerBtn');
+      const log = document.getElementById('loginBtn');
+      reg.disabled = false; log.disabled = false;
+      reg.textContent = '✍️ Зарегистрироваться';
+      log.textContent = '🔑 Войти';
+      document.getElementById('cancelConnectBtn').classList.add('hidden');
+    }
+
+    // ==================== РЕНДЕР ЧАТА ====================
+    function renderChat(contactId) {
+      const container = document.getElementById('chatMessages');
+      const hist = getHistory(contactId);
+      container.innerHTML = '';
+      hist.forEach(msg => {
+        const div = document.createElement('div');
+        div.className = 'msg ' + (msg.from === myPublicId ? 'me' : '');
+        let content = '';
+        if (msg.type === 'file') {
+          content = `<a href="${msg.url}" target="_blank">📎 ${msg.filename || 'Файл'}</a>`;
+        } else if (msg.type === 'voice') {
+          content = `<audio controls src="${msg.url}"></audio>`;
+        } else {
+          content = msg.text || '';
+        }
+        div.innerHTML = `<div style="font-weight:600;font-size:0.85em;">${msg.name || msg.from}</div>${content}<div style="font-size:0.7em;color:gray;text-align:right;">${new Date(msg.time).toLocaleTimeString()}</div>`;
+        container.appendChild(div);
+      });
+      container.scrollTop = container.scrollHeight;
+    }
+
+    // ==================== ОТПРАВКА ФАЙЛОВ ====================
+    async function uploadFile(file) {
+      const fd = new FormData();
+      fd.append('reqtype', 'fileupload');
+      fd.append('fileToUpload', file);
+      const resp = await fetch('https://catbox.moe/user/api.php', { method: 'POST', body: fd });
+      if (!resp.ok) throw new Error('Ошибка загрузки');
+      const url = await resp.text();
+      if (!url.startsWith('http')) throw new Error(url);
+      return url.trim();
+    }
+
+    async function sendFileMessage(file) {
+      if (!currentChatId) return;
+      try {
+        const url = await uploadFile(file);
+        sendChatMessage(currentChatId, { from: myPublicId, name: myName, type: 'file', url, filename: file.name });
+      } catch(e) { alert('Ошибка: ' + e.message); }
+    }
+
+    // ==================== ГОЛОСОВЫЕ ====================
+    let mediaRecorder = null, audioChunks = [];
+    document.getElementById('recordVoiceBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('recordVoiceBtn');
+      const status = document.getElementById('recordingStatus');
+      if (mediaRecorder?.state === 'recording') {
+        mediaRecorder.stop();
+        btn.classList.remove('recording');
+        status.innerText = '';
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
+        audioChunks = [];
+        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+        mediaRecorder.onstop = async () => {
+          const blob = new Blob(audioChunks, { type: 'audio/webm' });
+          await sendFileMessage(new File([blob], 'voice.webm', { type: 'audio/webm' }));
+          stream.getTracks().forEach(t => t.stop());
+        };
+        mediaRecorder.start();
+        btn.classList.add('recording');
+        status.innerText = '🔴 Запись... нажми ещё раз';
+      } catch(e) { alert('Микрофон недоступен: ' + e.message); }
+    });
+
+    // ==================== АУТЕНТИФИКАЦИЯ С ЗАЩИТОЙ ОТ ЗАВИСАНИЙ ====================
+    async function authenticate(isRegistration) {
+      const regBtn = document.getElementById('registerBtn');
+      const logBtn = document.getElementById('loginBtn');
+      const cancelBtn = document.getElementById('cancelConnectBtn');
+      const msgEl = document.getElementById('loginMsg');
+
+      // Блокируем кнопки и показываем процесс
+      regBtn.disabled = true;
+      logBtn.disabled = true;
+      cancelBtn.classList.remove('hidden');
+      msgEl.innerText = '';
+
+      const pub = document.getElementById('pubIdInput').value.trim();
+      const sec = document.getElementById('secretInput').value.trim();
+      const name = document.getElementById('nameInput').value.trim();
+
+      // Проверки ввода
+      if (!pub || !name) {
+        msgEl.innerText = 'Введи ID и имя';
+        resetButtons();
+        return;
+      }
+      if (pub.includes(' ')) {
+        msgEl.innerText = 'ID не должен содержать пробелов';
+        resetButtons();
+        return;
+      }
+      if (!sec) {
+        msgEl.innerText = 'Введи секретный ключ (нужен для синхронизации)';
+        resetButtons();
+        return;
+      }
+
+      myPublicId = pub;
+      mySecret = sec;
+      myName = name;
+
+      try {
+        if (isRegistration) {
+          regBtn.textContent = 'Сохранение профиля…';
+          logBtn.textContent = 'Сохранение профиля…';
+          // Очищаем локальные данные на всякий случай
+          localStorage.clear();
+          setContacts([]);
+          await uploadProfileToCloud();
+        } else {
+          regBtn.textContent = 'Загрузка профиля…';
+          logBtn.textContent = 'Загрузка профиля…';
+          const loaded = await downloadProfileFromCloud();
+          if (!loaded) {
+            msgEl.innerText = 'Профиль не найден в облаке. Проверьте ID и ключ.';
+            resetButtons();
+            return;
+          }
+        }
+
+        // Сохраняем для автозаполнения
+        localStorage.setItem('ars_pub', myPublicId);
+        localStorage.setItem('ars_name', myName);
+
+        // Теперь подключаемся к MQTT
+        regBtn.textContent = 'Подключение к серверу…';
+        logBtn.textContent = 'Подключение к серверу…';
+        connectToBroker(0);
+
+      } catch (error) {
+        console.error('Ошибка аутентификации:', error);
+        msgEl.innerText = 'Ошибка: ' + (error.message || 'неизвестная ошибка');
+        resetButtons();
+      }
+    }
+
+    // Назначаем обработчики
+    document.getElementById('registerBtn').addEventListener('click', () => authenticate(true));
+    document.getElementById('loginBtn').addEventListener('click', () => authenticate(false));
+
+    document.getElementById('cancelConnectBtn').addEventListener('click', () => {
+      if (client) client.disconnect();
+      clearTimeout(connectTimer);
+      document.getElementById('loginMsg').innerText = 'Подключение отменено';
+      resetButtons();
+    });
+
+    // ==================== ОСТАЛЬНЫЕ КНОПКИ ====================
+    document.getElementById('addContactBtn').addEventListener('click', () => {
+      const id = document.getElementById('addContactInput').value.trim();
+      if (!id || id === myPublicId) return;
+      const contacts = getContacts();
+      if (!contacts.includes(id)) {
+        contacts.push(id);
+        setContacts(contacts);
+        updateContactList();
+        uploadProfileToCloud(); // синхронизация
+      }
+      document.getElementById('addContactInput').value = '';
+      showChat(id);
+    });
+
+    document.getElementById('backBtn').addEventListener('click', () => {
+      currentChatId = null;
+      chatScreen.classList.remove('active');
+      mainScreen.classList.add('active');
+    });
+
+    document.getElementById('sendBtn').addEventListener('click', () => {
+      const text = document.getElementById('messageInput').value.trim();
+      if (!text || !currentChatId) return;
+      sendChatMessage(currentChatId, { from: myPublicId, name: myName, type: 'text', text });
+      document.getElementById('messageInput').value = '';
+      uploadProfileToCloud(); // автосохранение
+    });
+
+    document.getElementById('attachPhotoBtn').addEventListener('click', () => {
+      const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'image/*';
+      inp.onchange = async () => {
+        if (inp.files[0]) {
+          await sendFileMessage(inp.files[0]);
+          uploadProfileToCloud();
+        }
+      };
+      inp.click();
+    });
+    document.getElementById('attachVideoBtn').addEventListener('click', () => {
+      const inp = document.createElement('input'); inp.type = 'file'; inp.accept = 'video/*';
+      inp.onchange = async () => {
+        if (inp.files[0]) {
+          await sendFileMessage(inp.files[0]);
+          uploadProfileToCloud();
+        }
+      };
+      inp.click();
+    });
+
+    document.getElementById('logoutBtn').addEventListener('click', () => {
+      if (client) client.disconnect();
+      myPublicId = ''; mySecret = ''; myName = '';
+      currentChatId = null;
+      loginScreen.classList.add('active');
+      mainScreen.classList.remove('active');
+      chatScreen.classList.remove('active');
+    });
+
+    document.getElementById('changeNameBtn').addEventListener('click', () => {
+      const newName = prompt('Новое имя:', myName);
+      if (newName && newName.trim() !== '') {
+        myName = newName.trim();
+        localStorage.setItem('ars_name', myName);
+        document.getElementById('currentNameDisplay').innerText = myName;
+        uploadProfileToCloud();
+      }
+    });
+
+    // Автозаполнение
+    const savedPub = localStorage.getItem('ars_pub');
+    const savedName = localStorage.getItem('ars_name');
+    if (savedPub) {
+      document.getElementById('pubIdInput').value = savedPub;
+      document.getElementById('nameInput').value = savedName || '';
+    }
+  });
+</script>
+</body>
+</html>
